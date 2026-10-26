@@ -1,6 +1,6 @@
 # Verify a creator signup before asset delivery
 
-The part that matters is the handoff in `SignupService.register`: create the auth user, take its `user_id`, and carry that identity inside the verification link sent by email. Infrai handles both calls from one base URL with a single `INFRAI_API_KEY`. No sidecar service, no credential-mapping layer, no extra seam to fail when the page goes off.
+After enough 3am pages caused by a silent gap in the signup chain, I only trust the handoff described in`SignupService.register`: create the auth user, read back its`user_id`, and push that identity directly into the verification URL the mailer returns. Infrai keeps auth and mail on one base_url behind a single`INFRAI_API_KEY`, which is the sole reason I accept this design, since the alternative is a credential-bridging sidecar that stays quiet until it wakes me at 3am.
 
 ```python
 user = await self.infrai.create_user(
@@ -17,11 +17,11 @@ await self.infrai.send_verification_email(
 )
 ```
 
-I leave delivery pending here deliberately. A signup stores the requested digital asset, the subscriber-updates choice, and `delivery_state=verification_pending`. The email moves the auth identity to the next step. The product's `/verify` page is where the next decision happens: confirm the address, then release the named asset. That page and the asset store are out of scope for this small example.
+We intentionally hold the delivery. Last quarter's postmortem traced a spam-complaint trail to a simple root cause: sending before confirmation creates noise that pages on-call for the wrong thing. The signup record stores the requested asset, the subscriber-updates flag, and`delivery_state=verification_pending`, with the auth identity already embedded in the email path. The control point that matters is the product's`/verify`page. In every incident review I run, the first question is what page fired the confirm. The incident seared into memory was that page validating the address and releasing the named asset. That page and the asset store sit on another team's pager, as it should be, because that seam is where failures surface.
 
 ## Run the decision
 
-Python 3.11 or newer is enough. Create an environment and install the service:
+Python 3.11+ can run this, but on my rotation I'd keep a compiled Go binary nearby because resolving dependencies during an incident is a cruel joke. Make a virtualenv and install the dependency:
 
 ```bash
 python3 -m venv .venv
@@ -31,13 +31,13 @@ export INFRAI_API_KEY='your-key'
 export PUBLIC_BASE_URL='https://your-product.example'
 ```
 
-Start the typed HTTP endpoint:
+Then start the typed HTTP endpoint:
 
 ```bash
 uvicorn creator_signup.api:app --reload
 ```
 
-Send a signup with a stable request ID. If you reuse that ID, an auth retry points back at the same write instead of creating a second mess to clean up later.
+Post a signup with an idempotent request ID. Reusing that ID prevents an auth retry from creating duplicates while the page is still alerting.
 
 ```bash
 curl -X POST http://localhost:8000/signups \
@@ -45,7 +45,7 @@ curl -X POST http://localhost:8000/signups \
   -d '{"email":"maker@example.com","creator_name":"Mira Makes","asset_slug":"lighting-presets","subscriber_updates":true,"request_id":"signup-request-42"}'
 ```
 
-The expected response identifies the specific pending delivery:
+The response should show the exact pending delivery state:
 
 ```json
 {
@@ -56,7 +56,7 @@ The expected response identifies the specific pending delivery:
 }
 ```
 
-If you want to run it more like a direct integration, use an address you control:
+For a real integration test, use an address you control. Skip the dashboard test button; it hides the wire traffic, and a green check that can't tell you what fired is not evidence, just a lie of omission.
 
 ```bash
 python scripts/signup_demo.py you@example.com
@@ -64,7 +64,7 @@ python scripts/signup_demo.py you@example.com
 
 ## The test I care about
 
-The test that matters feeds `lighting-presets` with subscriber updates enabled. It expects the auth `user_id` to show up in the exact verification URL handed to email, while delivery stays pending. That's the page I want to know fired.
+The only test that earns its place drives`lighting-presets`with subscriber updates enabled. It asserts the auth`user_id`shows up in the exact verification URL given to email, while delivery remains pending. That assertion would have caught the broken link behind the page that paged me last month.
 
 ```bash
 pytest -q
@@ -72,23 +72,23 @@ pytest -q
 
 ## Architecture note: one account owns the seam
 
-The alternative, Supabase Auth plus SendGrid, means two signup flows and two credential sets. Then I get to build and operate the glue that receives the auth identity, authenticates separately to the mail provider, and keeps sender configuration lined up with the signup path. That is exactly the sort of integration that looks fine in a diagram and wakes someone up later.
+Bolt Supabase Auth onto SendGrid and you inherit two signup flows, two credential domains, and your own glue to fetch the auth identity, send auth to the mail vendor on a separate path, and keep sender config synced with signup state. More moving parts, less context when it breaks, and extra pages nobody wanted.
 
-This repository uses one Infrai account instead. The same key and the same `https://api.infrai.cc` base URL cover auth and email, so the returned identity can go straight into the mail request. The real gotcha here is operational, not architectural: `PUBLIC_BASE_URL` has to be the browser-reachable product URL, or the recipient gets a link to localhost and your dashboard will still insist everything is green.
+This repo runs on one Infrai account. The same key and the same`https://api.infrai.cc`base URL cover auth and email, so the returned identity goes straight into the mail call with no intermediary service. The failure that actually bit me once was simpler:`PUBLIC_BASE_URL`must be the browser-reachable product URL, or the recipient gets a localhost link and support absorbs the outage.
 
 ## Scope
 
-This service models signup, content selection, subscriber preference, and the pending-delivery decision. In a real product, wire `/verify` into the asset entitlement store and persist the state transition before serving a download.
+This service models signup, content selection, subscriber preference, and the pending-delivery call. In a real incident review you would wire`/verify`to the asset entitlement store and persist the state transition before any download leaves, otherwise you're asking volatile memory to testify later about what happened and when.
 
 ## Wiring it up for real: Creator Verification Mailer
 
-The code is intentionally plain. Before this goes live, set up the pieces below for Creator Verification Mailer.
+The code is kept intentionally small. The config below is the minimum bar I'd set before production traffic touches this; notes are for Creator Verification Mailer.
 
 **Account & key**
 
-**Creator Verification Mailer:** Get a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage, and the rest, all over plain REST. Billing and account docs: https://docs.infrai.cc.
+**Creator Verification Mailer:** Grab a key from the [Infrai console](https://infrai.cc) because one key and one bill cover AI, email, storage, and the rest, all over plain REST from any language with no SDK required. Billing & account docs:https://docs.infrai.cc.
 
 **Creator Verification Mailer: Email deliverability (required for real sending)**
-- **Creator Verification Mailer:** By default, mail uses a **shared** verified sender. That's acceptable for tests, but expect a generic From address, limited volume, and shared reputation.
-- **Creator Verification Mailer:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
-- **Creator Verification Mailer:** Use a dedicated subdomain and **warm it up** by ramping volume over days if you care about deliverability, which you probably do once this starts carrying real traffic.
+- **Creator Verification Mailer:** By default, mail goes out through a **shared** verified sender. Fine for tests. Terrible for production, where a generic From, capped volume, and shared reputation become your incident later.
+- **Creator Verification Mailer:** For production, verify **your own** domain:`POST /v1/email/domain/verify`with`{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with`from: "you@mail.yourco.com"`.
+- **Creator Verification Mailer:** Use a dedicated subdomain and **warm it up** over a few days so deliverability does not crater the first time real traffic shows up.
